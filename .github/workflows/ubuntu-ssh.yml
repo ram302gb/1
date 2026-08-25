@@ -1,0 +1,99 @@
+name: Ubuntu SSH via Tailscale
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-ssh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Install OpenSSH and Tailscale dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-server net-tools curl
+
+      - name: Configure SSH
+        run: |
+          # Allow password authentication (for the new user)
+          sudo sed -i 's/^#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          # Permit root login? Not needed, we will use a regular user.
+          sudo systemctl enable ssh
+          sudo systemctl start ssh
+          # Allow SSH port in firewall (if UFW active)
+          sudo ufw allow 22/tcp || true
+          sudo ufw reload || true
+
+      - name: Create SSH User with Secure Password
+        run: |
+          # Generate random password (16 chars)
+          PASSWORD=$(openssl rand -base64 16 | tr -d "=+/" | cut -c1-16)
+
+          # Create user 'sshuser' with home and bash
+          sudo useradd -m -s /bin/bash sshuser
+          echo "sshuser:$PASSWORD" | sudo chpasswd
+
+          # Optional: add to sudo group if needed
+          sudo usermod -aG sudo sshuser
+
+          echo "SSH_CREDS=User: sshuser | Password: $PASSWORD" >> $GITHUB_ENV
+
+          # Verify
+          if ! id "sshuser" &>/dev/null; then
+              echo "User creation failed"
+              exit 1
+          fi
+
+      - name: Install Tailscale
+        run: |
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.tailscale-keyring.list | sudo tee /etc/apt/sources.list.d/tailscale.list
+          sudo apt-get update
+          sudo apt-get install -y tailscale
+
+      - name: Establish Tailscale Connection
+        run: |
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$GITHUB_RUN_ID
+
+          TS_IP=""
+          RETRIES=0
+          while [ -z "$TS_IP" ] && [ $RETRIES -lt 10 ]; do
+              TS_IP=$(sudo tailscale ip -4)
+              sleep 5
+              RETRIES=$((RETRIES+1))
+          done
+
+          if [ -z "$TS_IP" ]; then
+              echo "Tailscale IP not assigned. Exiting."
+              exit 1
+          fi
+          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+
+      - name: Verify SSH Connectivity
+        run: |
+          echo "Tailscale IP: $TAILSCALE_IP"
+          # Test SSH port (22) using netcat
+          if nc -zv -w 5 $TAILSCALE_IP 22; then
+              echo "SSH port is reachable!"
+          else
+              echo "SSH port 22 not reachable"
+              exit 1
+          fi
+
+      - name: Maintain Connection
+        run: |
+          echo ""
+          echo "=== SSH ACCESS ==="
+          echo "Address: $TAILSCALE_IP"
+          echo "Username: sshuser"
+          echo "Password: $(echo $SSH_CREDS | sed 's/User: sshuser | Password: //')"
+          echo "Command: ssh sshuser@$TAILSCALE_IP"
+          echo "=================="
+          echo ""
+          echo "SSH session will stay active until you cancel this workflow."
+          while true; do
+              echo "[$(date)] SSH Active - Press Ctrl+C in Actions tab to stop"
+              sleep 300
+          done
