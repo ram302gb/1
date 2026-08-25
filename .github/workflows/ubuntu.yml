@@ -1,0 +1,102 @@
+name: Ubuntu RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Update and Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xrdp xfce4 xfce4-goodies tightvncserver netcat-openbsd
+          sudo systemctl enable xrdp
+          sudo systemctl start xrdp
+
+      - name: Configure XRDP
+        run: |
+          # Set XFCE as default session
+          echo "xfce4-session" > ~/.xsession
+          sudo sed -i 's/port=3389/port=3389/g' /etc/xrdp/xrdp.ini
+          sudo systemctl restart xrdp
+
+          # Allow port 3389 (in case UFW is active)
+          sudo ufw allow 3389/tcp || true
+          sudo ufw reload || true
+
+      - name: Create RDP User with Secure Password
+        run: |
+          # Generate strong password (16 chars, no ambiguous symbols)
+          PASSWORD=$(openssl rand -base64 16 | tr -d "=+/" | cut -c1-16)
+
+          # Create user with home directory and bash shell
+          sudo useradd -m -s /bin/bash rdpuser
+          echo "rdpuser:$PASSWORD" | sudo chpasswd
+
+          # Add to groups (optional: remove sudo if not needed)
+          sudo usermod -aG sudo,ssl-cert rdpuser
+
+          # Create .xsession for the user
+          sudo -u rdpuser bash -c 'echo "xfce4-session" > ~/.xsession'
+
+          echo "RDP_CREDS=User: rdpuser | Password: $PASSWORD" >> $GITHUB_ENV
+
+          # Verify user
+          if ! id "rdpuser" &>/dev/null; then
+              echo "User creation failed"
+              exit 1
+          fi
+
+      - name: Install Tailscale
+        run: |
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.tailscale-keyring.list | sudo tee /etc/apt/sources.list.d/tailscale.list
+          sudo apt-get update
+          sudo apt-get install -y tailscale
+
+      - name: Establish Tailscale Connection
+        run: |
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$GITHUB_RUN_ID
+
+          TS_IP=""
+          RETRIES=0
+          while [ -z "$TS_IP" ] && [ $RETRIES -lt 10 ]; do
+              TS_IP=$(sudo tailscale ip -4)
+              sleep 5
+              RETRIES=$((RETRIES+1))
+          done
+
+          if [ -z "$TS_IP" ]; then
+              echo "Tailscale IP not assigned. Exiting."
+              exit 1
+          fi
+          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+
+      - name: Verify RDP Accessibility
+        run: |
+          echo "Tailscale IP: $TAILSCALE_IP"
+          # Use netcat with timeout, check exit code
+          if nc -zv -w 5 $TAILSCALE_IP 3389; then
+              echo "TCP connectivity successful!"
+          else
+              echo "TCP connection to RDP port 3389 failed"
+              exit 1
+          fi
+
+      - name: Maintain Connection
+        run: |
+          echo ""
+          echo "=== RDP ACCESS ==="
+          echo "Address: $TAILSCALE_IP"
+          echo "Username: rdpuser"
+          echo "Password: $(echo $RDP_CREDS | sed 's/User: rdpuser | Password: //')"
+          echo "=================="
+          echo ""
+          echo "RDP session will stay active until you cancel this workflow."
+          while true; do
+              echo "[$(date)] RDP Active - Press Ctrl+C in Actions tab to stop"
+              sleep 300
+          done
